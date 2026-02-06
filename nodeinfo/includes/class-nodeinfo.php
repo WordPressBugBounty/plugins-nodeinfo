@@ -1,126 +1,183 @@
 <?php
 /**
- * Nodeinfo class
+ * Nodeinfo Class
  *
- * @link https://github.com/jhass/nodeinfo
+ * @package Nodeinfo
+ */
+
+namespace Nodeinfo;
+
+use Nodeinfo\Controller\Nodeinfo as Controller_Nodeinfo;
+use Nodeinfo\Controller\Nodeinfo2 as Controller_Nodeinfo2;
+use Nodeinfo\Integration\Nodeinfo10;
+use Nodeinfo\Integration\Nodeinfo11;
+use Nodeinfo\Integration\Nodeinfo20;
+use Nodeinfo\Integration\Nodeinfo21;
+use Nodeinfo\Integration\Nodeinfo22;
+
+/**
+ * Nodeinfo Class
+ *
+ * @package Nodeinfo
  */
 class Nodeinfo {
-	public $version           = '2.0';
-	public $software          = array();
-	public $usage             = array();
-	public $openRegistrations = false; // phpcs:ignore
-	public $services          = array(
-		'inbound'  => array(),
-		'outbound' => array(),
-	);
-	public $protocols         = array();
-	public $metadata          = array();
+	/**
+	 * Instance of the class.
+	 *
+	 * @var Nodeinfo
+	 */
+	private static $instance;
 
-	public function __construct( $version = '2.0' ) {
-		if ( in_array( $version, array( '1.0', '1.1', '2.0', '2.1' ), true ) ) {
-			$this->version = $version;
+	/**
+	 * Whether the class has been initialized.
+	 *
+	 * @var boolean
+	 */
+	private $initialized = false;
+
+	/**
+	 * Get the instance of the class.
+	 *
+	 * @return Nodeinfo
+	 */
+	public static function get_instance() {
+		if ( null === self::$instance ) {
+			self::$instance = new self();
 		}
 
-		$this->generate_software();
-		$this->generate_usage();
-		$this->generate_protocols();
-		$this->generate_services();
-		$this->generate_metadata();
-		$this->openRegistrations = (boolean) get_option( 'users_can_register', false ); // phpcs:ignore
+		return self::$instance;
 	}
 
-	public function generate_usage() {
-		$users = get_users(
-			array(
-				'fields'         => 'ID',
-				'capability__in' => array( 'publish_posts' ),
-			)
-		);
+	/**
+	 * Do not allow multiple instances of the class.
+	 */
+	private function __construct() {
+		// Do nothing.
+	}
 
-		if ( is_array( $users ) ) {
-			$users = count( $users );
-		} else {
-			$users = 1;
+	/**
+	 * Initialize the plugin.
+	 */
+	public function init() {
+		if ( $this->initialized ) {
+			return;
 		}
 
-		$posts    = wp_count_posts();
-		$comments = wp_count_comments();
+		$this->register_integrations();
+		$this->register_hooks();
 
-		$this->usage = apply_filters(
-			'nodeinfo_data_usage',
-			array(
-				'users'         => array(
-					'total'          => $users,
-					'activeMonth'    => nodeinfo_get_active_users( '1 month ago' ),
-					'activeHalfyear' => nodeinfo_get_active_users( '6 month ago' ),
-				),
-				'localPosts'    => (int) $posts->publish,
-				'localComments' => (int) $comments->approved,
-			),
-			$this->version
-		);
-	}
-
-	public function generate_software() {
-		$software = array(
-			'name'    => 'wordpress',
-			'version' => nodeinfo_get_masked_version(),
-		);
-
-		if ( '2.1' === $this->version ) {
-			$software['repository'] = 'https://github.com/wordpress/wordpress';
+		if ( \is_admin() ) {
+			$this->register_admin_hooks();
 		}
 
-		$this->software = apply_filters(
-			'nodeinfo_data_software',
-			$software,
-			$this->version
+		$this->initialized = true;
+	}
+
+	/**
+	 * Register NodeInfo version integrations.
+	 *
+	 * These only register filters, so they can be called directly.
+	 */
+	public function register_integrations() {
+		Nodeinfo10::init();
+		Nodeinfo11::init();
+		Nodeinfo20::init();
+		Nodeinfo21::init();
+		Nodeinfo22::init();
+	}
+
+	/**
+	 * Register hooks.
+	 */
+	public function register_hooks() {
+		// Register REST routes.
+		\add_action( 'rest_api_init', array( $this, 'register_routes' ) );
+
+		// Add WebFinger and Host-Meta discovery.
+		\add_filter( 'webfinger_user_data', array( Controller_Nodeinfo::class, 'jrd' ), 10, 3 );
+		\add_filter( 'webfinger_post_data', array( Controller_Nodeinfo::class, 'jrd' ), 10, 3 );
+		\add_filter( 'host_meta', array( Controller_Nodeinfo::class, 'jrd' ) );
+
+		// Add rewrite rules for well-known endpoints (only during flush).
+		\add_filter( 'rewrite_rules_array', array( $this, 'add_rewrite_rules' ) );
+
+		// Register deprecated filter handlers.
+		\add_filter( 'nodeinfo_discovery', array( $this, 'deprecated_wellknown_nodeinfo_data' ), 99 );
+	}
+
+	/**
+	 * Handles the deprecated wellknown_nodeinfo_data filter.
+	 *
+	 * @param array $discovery The discovery document.
+	 * @return array The filtered discovery document.
+	 */
+	public function deprecated_wellknown_nodeinfo_data( $discovery ) {
+		/**
+		 * Filters the NodeInfo discovery document.
+		 *
+		 * @deprecated 3.0.0 Use nodeinfo_discovery instead.
+		 *
+		 * @param array $discovery The discovery document.
+		 */
+		return \apply_filters_deprecated(
+			'wellknown_nodeinfo_data',
+			array( $discovery ),
+			'3.0.0',
+			'nodeinfo_discovery'
 		);
 	}
 
-	public function generate_protocols() {
-		$protocols = $this->protocols;
-
-		if ( version_compare( $this->version, '2.0', '>=' ) ) {
-			$protocols = array();
-		} else {
-			$protocols['inbound']  = array( 'smtp' );
-			$protocols['outbound'] = array( 'smtp' );
-		}
-
-		$this->protocols = apply_filters( 'nodeinfo_data_protocols', $protocols, $this->version );
+	/**
+	 * Register admin hooks.
+	 */
+	public function register_admin_hooks() {
+		// Initialize Site Health checks.
+		\add_action( 'admin_init', array( Health_Check::class, 'init' ) );
 	}
 
-	public function generate_services() {
-		$services = $this->services;
+	/**
+	 * Register REST API routes.
+	 */
+	public function register_routes() {
+		$nodeinfo_controller = new Controller_Nodeinfo();
+		$nodeinfo_controller->register_routes();
 
-		if ( version_compare( $this->version, '2.0', '>=' ) ) {
-			$services['inbound']  = array( 'atom1.0', 'rss2.0', 'pop3' );
-			$services['outbound'] = array( 'atom1.0', 'rss2.0', 'wordpress', 'smtp' );
-		} else {
-			$services['outbound'] = array( 'smtp' );
-		}
-
-		$this->services = apply_filters( 'nodeinfo_data_services', $services, $this->version );
+		$nodeinfo2_controller = new Controller_Nodeinfo2();
+		$nodeinfo2_controller->register_routes();
 	}
 
-	public function generate_metadata() {
-		$metadata = $this->metadata;
-
-		$metadata['generator'] = array(
-			'name'       => 'NodeInfo WordPress-Plugin',
-			'version'    => nodeinfo_version(),
-			'repository' => 'https://github.com/pfefferle/wordpress-nodeinfo/',
+	/**
+	 * Add rewrite rules for well-known endpoints.
+	 *
+	 * @param array $rules The existing rewrite rules.
+	 * @return array The modified rewrite rules.
+	 */
+	public function add_rewrite_rules( $rules ) {
+		$new_rules = array(
+			'^.well-known/nodeinfo'    => 'index.php?rest_route=/nodeinfo/discovery',
+			'^.well-known/x-nodeinfo2' => 'index.php?rest_route=/nodeinfo2/1.0',
 		);
 
-		$metadata['nodeName']        = \get_bloginfo( 'name' );
-		$metadata['nodeDescription'] = \get_bloginfo( 'description' );
-		$metadata['nodeIcon']        = \get_site_icon_url();
-
-		$this->metadata = apply_filters( 'nodeinfo_data_metadata', $metadata, $this->version );
+		return \array_merge( $new_rules, $rules );
 	}
 
-	public function to_array() {
-		return apply_filters( 'nodeinfo_data', get_object_vars( $this ), $this->version );
+	/**
+	 * Handle plugin activation.
+	 *
+	 * Initializes the plugin and flushes rewrite rules. The rewrite_rules_array
+	 * filter will add our rules during the flush.
+	 */
+	public static function activate() {
+		self::get_instance()->init();
+		\flush_rewrite_rules();
+	}
+
+	/**
+	 * Handle plugin deactivation.
+	 *
+	 * Should be called on plugin deactivation.
+	 */
+	public static function deactivate() {
+		\flush_rewrite_rules();
 	}
 }
